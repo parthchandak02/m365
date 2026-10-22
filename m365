@@ -1,0 +1,611 @@
+#!/usr/bin/env python3
+"""Mailbox CLI for a Microsoft 365 account. Device-code login, Graph mail.
+
+ponytail: stdlib only. In-Place Archive is out of reach (Graph does not serve it).
+Override the app with M365_CLIENT_ID if the tenant blocks the built-in one.
+"""
+
+import argparse
+import html
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except Exception:
+    pass
+
+CLIENT_ID = os.environ.get("M365_CLIENT_ID", "14d82eec-204b-4c2f-b7e8-296a70dab67e")
+TENANT = os.environ.get("M365_TENANT", "wsu.edu")
+ACCOUNT = os.environ.get("M365_ACCOUNT", "")
+GRAPH = "https://graph.microsoft.com/v1.0"
+SCOPES = (
+    "offline_access "
+    "https://graph.microsoft.com/User.Read "
+    "https://graph.microsoft.com/Mail.ReadWrite "
+    "https://graph.microsoft.com/Mail.Send"
+)
+CONFIG = Path(os.environ.get("M365_CONFIG_DIR", Path.home() / ".config" / "m365-wsu"))
+TOKEN = CONFIG / "token.json"
+UA = "m365-wsu-cli/1"
+LIST_SELECT = "id,subject,from,receivedDateTime,isRead,bodyPreview"
+READ_SELECT = LIST_SELECT + ",body,toRecipients,ccRecipients"
+FOLDERS = {
+    "inbox": "inbox",
+    "sent": "sentitems",
+    "sentitems": "sentitems",
+    "sent items": "sentitems",
+    "drafts": "drafts",
+    "archive": "archive",
+    "junk": "junkemail",
+    "junk email": "junkemail",
+    "junkemail": "junkemail",
+    "deleted": "deleteditems",
+    "deleted items": "deleteditems",
+    "deleteditems": "deleteditems",
+    "trash": "deleteditems",
+    "outbox": "outbox",
+}
+
+
+def die(msg, code=1):
+    print(msg, file=sys.stderr)
+    raise SystemExit(code)
+
+
+def auth_base():
+    return f"https://login.microsoftonline.com/{TENANT}"
+
+
+def err_text(payload):
+    if isinstance(payload, str):
+        return payload
+    if not isinstance(payload, dict):
+        return str(payload)
+    if payload.get("error_description"):
+        desc = str(payload["error_description"]).split("\r\n", 1)[0]
+        return f"{payload.get('error', 'auth')}: {desc}"
+    err = payload.get("error")
+    if isinstance(err, dict):
+        return f"{err.get('code', 'error')}: {err.get('message', '')}"
+    if isinstance(err, str):
+        return err
+    return json.dumps(payload)[:500]
+
+
+def consent_hint(text):
+    low = text.lower()
+    if any(s in text for s in ("65001", "65002", "90094", "7000112", "50105", "700016")) or "consent" in low:
+        return (
+            "\nWSU blocked this app or Mail.ReadWrite/Mail.Send. "
+            "Needs admin consent, or set M365_CLIENT_ID to your own public client. "
+            "In-Place Archive is a separate problem: Graph cannot read it."
+        )
+    return ""
+
+
+def request(method, url, body=None, headers=None, form=False):
+    data = None
+    hdrs = {"User-Agent": UA}
+    if headers:
+        hdrs.update(headers)
+    if body is not None:
+        if form:
+            data = urllib.parse.urlencode(body).encode()
+            hdrs["Content-Type"] = "application/x-www-form-urlencoded"
+        else:
+            data = json.dumps(body).encode()
+            hdrs["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=hdrs, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            raw = resp.read()
+            return resp.status, json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as e:
+        raw = e.read()
+        try:
+            payload = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            payload = {"error": raw.decode("utf-8", "replace")[:500]}
+        return e.code, payload
+
+
+def save_token(data):
+    CONFIG.mkdir(parents=True, exist_ok=True)
+    os.chmod(CONFIG, 0o700)
+    tmp = TOKEN.with_suffix(".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        json.dump(data, fh)
+    os.replace(tmp, TOKEN)
+
+
+def load_token():
+    try:
+        return json.loads(TOKEN.read_text())
+    except FileNotFoundError:
+        die("not signed in. run: ./m365 login", 2)
+    except json.JSONDecodeError:
+        die(f"broken token file: {TOKEN}", 2)
+
+
+def stamp(tok, flow, account=None):
+    out = {
+        "access_token": tok["access_token"],
+        "refresh_token": tok.get("refresh_token"),
+        "expires_at": time.time() + int(tok.get("expires_in", 3600)),
+        "flow": flow,
+    }
+    if account:
+        out["account"] = account
+    return out
+
+
+def refresh(saved):
+    flow = saved.get("flow", "v2")
+    if not saved.get("refresh_token"):
+        die("session expired. run: ./m365 login", 2)
+    body = {
+        "grant_type": "refresh_token",
+        "client_id": CLIENT_ID,
+        "refresh_token": saved["refresh_token"],
+    }
+    if flow == "v1":
+        url = f"{auth_base()}/oauth2/token"
+        body["resource"] = "https://graph.microsoft.com/"
+    else:
+        url = f"{auth_base()}/oauth2/v2.0/token"
+        body["scope"] = SCOPES
+    status, tok = request("POST", url, body, form=True)
+    if status >= 400 or "access_token" not in tok:
+        text = err_text(tok)
+        die(text + consent_hint(text), 2)
+    tok = stamp(tok, flow, saved.get("account"))
+    if not tok.get("refresh_token"):
+        tok["refresh_token"] = saved["refresh_token"]
+    save_token(tok)
+    return tok
+
+
+def access_token(force=False):
+    saved = load_token()
+    if force or saved.get("expires_at", 0) < time.time() + 120:
+        saved = refresh(saved)
+    return saved["access_token"]
+
+
+def graph(method, url, body=None, headers=None, retry=True):
+    hdrs = {
+        "Authorization": f"Bearer {access_token()}",
+        "Accept": "application/json",
+    }
+    if headers:
+        hdrs.update(headers)
+    status, data = request(method, url, body, hdrs)
+    if status == 401 and retry:
+        access_token(force=True)
+        return graph(method, url, body, headers, retry=False)
+    if status == 429 and retry:
+        time.sleep(2)
+        return graph(method, url, body, headers, retry=False)
+    return status, data
+
+
+def ok(status, data):
+    if status >= 400:
+        text = err_text(data)
+        die(text + consent_hint(text), 2 if status in (401, 403) else 1)
+    return data
+
+
+def start_device():
+    status, data = request(
+        "POST",
+        f"{auth_base()}/oauth2/v2.0/devicecode",
+        {"client_id": CLIENT_ID, "scope": SCOPES},
+        form=True,
+    )
+    if status < 400 and data.get("device_code"):
+        return "v2", data
+    v2_err = err_text(data)
+    status, data = request(
+        "POST",
+        f"{auth_base()}/oauth2/devicecode",
+        {"client_id": CLIENT_ID, "resource": "https://graph.microsoft.com/"},
+        form=True,
+    )
+    if status < 400 and data.get("device_code"):
+        return "v1", data
+    text = err_text(data) if status >= 400 else v2_err
+    die(text + consent_hint(text), 2)
+
+
+def poll_token(flow, device):
+    interval = int(device.get("interval") or 5)
+    deadline = time.time() + int(device.get("expires_in") or 900)
+    if flow == "v1":
+        url = f"{auth_base()}/oauth2/token"
+        body = {
+            "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+            "client_id": CLIENT_ID,
+            "code": device["device_code"],
+        }
+    else:
+        url = f"{auth_base()}/oauth2/v2.0/token"
+        body = {
+            "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+            "client_id": CLIENT_ID,
+            "device_code": device["device_code"],
+        }
+    while time.time() < deadline:
+        time.sleep(interval)
+        status, tok = request("POST", url, body, form=True)
+        if tok.get("access_token"):
+            return tok
+        err = tok.get("error", "")
+        if err == "authorization_pending":
+            continue
+        if err == "slow_down":
+            interval += 5
+            continue
+        text = err_text(tok)
+        die(text + consent_hint(text), 2)
+    die("device code expired. run: ./m365 login", 2)
+
+
+def addresses(me):
+    return [me.get("mail") or "", me.get("userPrincipalName") or ""]
+
+
+def is_expected(me):
+    if not ACCOUNT:
+        return True
+    want = ACCOUNT.lower()
+    local = want.split("@", 1)[0] + "@"
+    for addr in addresses(me):
+        low = addr.lower()
+        if low == want or low.startswith(local):
+            return True
+    return False
+
+
+def cmd_login(_args):
+    flow, device = start_device()
+    code = device.get("user_code", "")
+    print(device.get("message") or f"Open {device.get('verification_uri')} and enter {code}", file=sys.stderr)
+    if ACCOUNT:
+        print(f"Sign in as {ACCOUNT}", file=sys.stderr)
+    try:
+        subprocess.run(["pbcopy"], input=code.encode(), check=False, timeout=2)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    uri = device.get("verification_uri") or "https://microsoft.com/devicelogin"
+    subprocess.run(["open", uri], check=False)
+    tok = poll_token(flow, device)
+    saved = stamp(tok, flow)
+    save_token(saved)
+    me = ok(*graph("GET", f"{GRAPH}/me?$select=displayName,mail,userPrincipalName"))
+    if not is_expected(me):
+        TOKEN.unlink(missing_ok=True)
+        got = me.get("mail") or me.get("userPrincipalName")
+        die(f"signed in as {got}, wanted {ACCOUNT}. token discarded.", 2)
+    saved["account"] = me.get("mail") or me.get("userPrincipalName")
+    save_token(saved)
+    if not saved.get("refresh_token"):
+        print("no refresh token; session lasts about an hour", file=sys.stderr)
+    emit({"account": saved["account"], "name": me.get("displayName")}, f"signed in as {saved['account']}")
+
+
+def cmd_logout(_args):
+    TOKEN.unlink(missing_ok=True)
+    print("signed out")
+
+
+def cmd_whoami(args):
+    me = ok(*graph("GET", f"{GRAPH}/me?$select=displayName,mail,userPrincipalName"))
+    emit(me, f"{me.get('displayName')}\n{me.get('mail') or me.get('userPrincipalName')}")
+
+
+def normalize_folder(name):
+    key = " ".join(name.strip().lower().split())
+    return FOLDERS.get(key, name.strip())
+
+
+def folder_path(name):
+    return urllib.parse.quote(normalize_folder(name), safe="")
+
+
+def clip(text, n=78):
+    text = " ".join((text or "").split())
+    return text if len(text) <= n else text[: n - 3] + "..."
+
+
+def when(iso):
+    if not iso:
+        return ""
+    dt = datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone()
+    return dt.strftime("%Y-%m-%d %H:%M")
+
+
+def sender(msg):
+    ea = (msg.get("from") or {}).get("emailAddress") or {}
+    return ea.get("address") or ea.get("name") or "?"
+
+
+def html_to_text(raw):
+    text = re.sub(r"(?is)<(script|style)\b.*?>.*?</\1>", " ", raw or "")
+    text = re.sub(r"(?i)<br\s*/?>", "\n", text)
+    text = re.sub(r"(?i)</p>", "\n\n", text)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return html.unescape(text).strip()
+
+
+def body_text(msg):
+    body = msg.get("body") or {}
+    content = body.get("content") or ""
+    if (body.get("contentType") or "").lower() == "html":
+        return html_to_text(content)
+    return content.strip()
+
+
+def emit(data, human):
+    if ARGS.json:
+        json.dump(data, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+    else:
+        print(human)
+
+
+def list_messages(folder, top, unread):
+    params = {
+        "$top": str(top),
+        "$select": LIST_SELECT,
+        "$orderby": "receivedDateTime desc",
+    }
+    if unread:
+        params["$filter"] = "isRead eq false"
+    url = f"{GRAPH}/me/mailFolders/{folder_path(folder)}/messages?{urllib.parse.urlencode(params)}"
+    status, data = graph("GET", url)
+    if status == 400:
+        params.pop("$orderby", None)
+        url = f"{GRAPH}/me/mailFolders/{folder_path(folder)}/messages?{urllib.parse.urlencode(params)}"
+        status, data = graph("GET", url)
+        if status < 400:
+            data["value"] = sorted(
+                data.get("value") or [],
+                key=lambda m: m.get("receivedDateTime") or "",
+                reverse=True,
+            )
+    return ok(status, data)
+
+
+def fmt_list(msgs):
+    if not msgs:
+        return "(none)"
+    lines = []
+    for msg in msgs:
+        flag = "*" if not msg.get("isRead", True) else " "
+        lines.append(f"{flag} {when(msg.get('receivedDateTime'))}  {sender(msg)}  {clip(msg.get('subject') or '(no subject)')}")
+        lines.append(f"  {msg.get('id')}")
+    return "\n".join(lines)
+
+
+def cmd_list(args):
+    check_top(args.top)
+    data = list_messages(args.folder, args.top, args.unread)
+    emit(data.get("value") or [], fmt_list(data.get("value") or []))
+
+
+def cmd_read(args):
+    mid = urllib.parse.quote(args.id, safe="")
+    msg = ok(*graph(
+        "GET",
+        f"{GRAPH}/me/messages/{mid}?$select={READ_SELECT}",
+        headers={"Prefer": 'outlook.body-content-type="text"'},
+    ))
+    tos = ", ".join(
+        (r.get("emailAddress") or {}).get("address", "")
+        for r in msg.get("toRecipients") or []
+    )
+    human = (
+        f"From:    {sender(msg)}\n"
+        f"To:      {tos}\n"
+        f"Date:    {when(msg.get('receivedDateTime'))}\n"
+        f"Subject: {msg.get('subject') or ''}\n\n"
+        f"{body_text(msg)}"
+    )
+    emit(msg, human)
+
+
+def cmd_search(args):
+    check_top(args.top)
+    query = args.query.replace('"', " ").strip()
+    if not query:
+        die("empty search")
+    params = {
+        "$top": str(args.top),
+        "$select": LIST_SELECT,
+        "$search": f'"{query}"',
+    }
+    url = f"{GRAPH}/me/messages?{urllib.parse.urlencode(params)}"
+    data = ok(*graph("GET", url))
+    msgs = sorted(data.get("value") or [], key=lambda m: m.get("receivedDateTime") or "", reverse=True)
+    emit(msgs, fmt_list(msgs))
+
+
+def check_addr(addr):
+    if addr.count("@") != 1 or addr.startswith("@") or addr.endswith("@"):
+        die(f"bad address: {addr}")
+
+
+def take_body(body):
+    if body is not None:
+        return body
+    if not sys.stdin.isatty():
+        return sys.stdin.read()
+    die("pass --body or pipe the message on stdin")
+
+
+def recipients(addrs):
+    for addr in addrs or []:
+        check_addr(addr)
+    return [{"emailAddress": {"address": a}} for a in addrs or []]
+
+
+def cmd_send(args):
+    message = {
+        "subject": args.subject,
+        "body": {"contentType": "Text", "content": take_body(args.body)},
+        "toRecipients": recipients(args.to),
+    }
+    if args.cc:
+        message["ccRecipients"] = recipients(args.cc)
+    ok(*graph("POST", f"{GRAPH}/me/sendMail", {"message": message}))
+    emit({"sent": True, "to": args.to}, "sent")
+
+
+def cmd_reply(args):
+    mid = urllib.parse.quote(args.id, safe="")
+    action = "replyAll" if args.all else "reply"
+    ok(*graph("POST", f"{GRAPH}/me/messages/{mid}/{action}", {"comment": take_body(args.body)}))
+    emit({"replied": True, "all": bool(args.all)}, "replied")
+
+
+def cmd_move(args):
+    mid = urllib.parse.quote(args.id, safe="")
+    dest = normalize_folder(args.folder)
+    msg = ok(*graph("POST", f"{GRAPH}/me/messages/{mid}/move", {"destinationId": dest}))
+    emit(msg, f"moved to {args.folder}\n{msg.get('id', '')}")
+
+
+def cmd_folders(_args):
+    url = f"{GRAPH}/me/mailFolders?$top=50&$select=id,displayName,unreadItemCount,totalItemCount"
+    rows = []
+    while url and len(rows) < 200:
+        data = ok(*graph("GET", url))
+        rows.extend(data.get("value") or [])
+        url = data.get("@odata.nextLink")
+    lines = [f"{r.get('unreadItemCount', 0):4} unread  {r.get('totalItemCount', 0):5} total  {r.get('displayName')}\n  {r.get('id')}" for r in rows]
+    emit(rows, "\n".join(lines) if lines else "(none)")
+
+
+def check_top(n):
+    if not 1 <= n <= 100:
+        die("--top must be 1..100")
+
+
+def build_parser():
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true")
+    p = argparse.ArgumentParser(
+        prog="m365",
+        description="Mail CLI for a Microsoft 365 mailbox (Graph, device-code login).",
+        epilog=(
+            "Primary mailbox only. Graph cannot read the Exchange In-Place Archive. "
+            "Env: M365_CLIENT_ID, M365_TENANT, M365_ACCOUNT, M365_CONFIG_DIR."
+        ),
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("login", parents=[common], help="device-code sign-in")
+    sub.add_parser("logout", parents=[common], help="forget the saved token")
+    sub.add_parser("whoami", parents=[common], help="signed-in account")
+    pl = sub.add_parser("list", parents=[common], help="list messages")
+    pl.add_argument("--folder", default="inbox")
+    pl.add_argument("--top", type=int, default=20)
+    pl.add_argument("--unread", action="store_true")
+    pr = sub.add_parser("read", parents=[common], help="print one message")
+    pr.add_argument("id")
+    ps = sub.add_parser("search", parents=[common], help='KQL search, e.g. from:alice subject:invoice')
+    ps.add_argument("query")
+    ps.add_argument("--top", type=int, default=20)
+    se = sub.add_parser("send", parents=[common], help="send mail as the signed-in account")
+    se.add_argument("--to", action="append", required=True)
+    se.add_argument("--cc", action="append")
+    se.add_argument("--subject", required=True)
+    se.add_argument("--body", help="omit to read stdin")
+    rp = sub.add_parser("reply", parents=[common], help="reply to a message")
+    rp.add_argument("id")
+    rp.add_argument("--body", help="omit to read stdin")
+    rp.add_argument("--all", action="store_true", help="reply all")
+    mv = sub.add_parser("move", parents=[common], help="move a message")
+    mv.add_argument("id")
+    mv.add_argument("--folder", required=True, help="inbox, sent, archive, junk, deleted, or a folder id")
+    sub.add_parser("folders", parents=[common], help="list mailbox folders")
+    return p
+
+
+ARGS = argparse.Namespace(json=False)
+COMMANDS = {
+    "login": cmd_login,
+    "logout": cmd_logout,
+    "whoami": cmd_whoami,
+    "list": cmd_list,
+    "read": cmd_read,
+    "search": cmd_search,
+    "send": cmd_send,
+    "reply": cmd_reply,
+    "move": cmd_move,
+    "folders": cmd_folders,
+}
+
+
+def main(argv=None):
+    global ARGS
+    ARGS = build_parser().parse_args(argv)
+    try:
+        COMMANDS[ARGS.cmd](ARGS)
+    except urllib.error.URLError as e:
+        die(f"network: {e.reason}")
+    except KeyboardInterrupt:
+        raise SystemExit(130)
+
+
+def _self_check():
+    assert normalize_folder("Sent Items") == "sentitems"
+    assert normalize_folder("INBOX") == "inbox"
+    assert normalize_folder("AAMkRawId") == "AAMkRawId"
+    assert html_to_text("<p>Hello</p><br>there") == "Hello\n\nthere"
+    assert "<" not in html_to_text("<b>x</b><script>nope</script>")
+    assert sender({"from": {"emailAddress": {"address": "a@wsu.edu"}}}) == "a@wsu.edu"
+    assert is_expected({"mail": "jane.doe@example.com", "userPrincipalName": "x"})
+    assert not is_expected({"mail": "other@wsu.edu", "userPrincipalName": "other@wsu.edu"})
+    listed = fmt_list([{
+        "isRead": False,
+        "receivedDateTime": "2026-10-06T20:00:00Z",
+        "subject": "Hi",
+        "id": "AAMk",
+        "from": {"emailAddress": {"address": "a@wsu.edu"}},
+    }])
+    assert listed.startswith("* ") and "a@wsu.edu" in listed and "AAMk" in listed
+    assert clip("x" * 100).endswith("...")
+    check_addr("a@b.co")
+    held, sys.stderr = sys.stderr, open(os.devnull, "w")
+    try:
+        try:
+            check_addr("not-an-email")
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("bad address accepted")
+    finally:
+        sys.stderr.close()
+        sys.stderr = held
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "self-check":
+        _self_check()
+        print("ok")
+    else:
+        main()
