@@ -88,7 +88,7 @@ def consent_hint(text):
     low = text.lower()
     if any(s in text for s in ("65001", "65002", "90094", "7000112", "50105", "700016")) or "consent" in low:
         return (
-            "\nWSU blocked this app or Mail.ReadWrite/Mail.Send. "
+            "\nYour organisation blocked this app or Mail.ReadWrite/Mail.Send. "
             "Needs admin consent, or set M365_CLIENT_ID to your own public client. "
             "In-Place Archive is a separate problem: Graph cannot read it."
         )
