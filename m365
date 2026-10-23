@@ -26,7 +26,7 @@ except Exception:
     pass
 
 CLIENT_ID = os.environ.get("M365_CLIENT_ID", "14d82eec-204b-4c2f-b7e8-296a70dab67e")
-TENANT = os.environ.get("M365_TENANT", "wsu.edu")
+TENANT = os.environ.get("M365_TENANT", "organizations")
 ACCOUNT = os.environ.get("M365_ACCOUNT", "")
 GRAPH = "https://graph.microsoft.com/v1.0"
 SCOPES = (
@@ -35,9 +35,10 @@ SCOPES = (
     "https://graph.microsoft.com/Mail.ReadWrite "
     "https://graph.microsoft.com/Mail.Send"
 )
-CONFIG = Path(os.environ.get("M365_CONFIG_DIR", Path.home() / ".config" / "m365-wsu"))
+_LEGACY_CONFIG = Path.home() / ".config" / "m365-wsu"
+CONFIG = Path(os.environ.get("M365_CONFIG_DIR") or (_LEGACY_CONFIG if _LEGACY_CONFIG.exists() else Path.home() / ".config" / "m365"))
 TOKEN = CONFIG / "token.json"
-UA = "m365-wsu-cli/1"
+UA = "m365-cli/1"
 LIST_SELECT = "id,subject,from,receivedDateTime,isRead,bodyPreview"
 READ_SELECT = LIST_SELECT + ",body,toRecipients,ccRecipients"
 FOLDERS = {
@@ -577,17 +578,22 @@ def _self_check():
     assert normalize_folder("AAMkRawId") == "AAMkRawId"
     assert html_to_text("<p>Hello</p><br>there") == "Hello\n\nthere"
     assert "<" not in html_to_text("<b>x</b><script>nope</script>")
-    assert sender({"from": {"emailAddress": {"address": "a@wsu.edu"}}}) == "a@wsu.edu"
-    assert is_expected({"mail": "jane.doe@example.com", "userPrincipalName": "x"})
-    assert not is_expected({"mail": "other@wsu.edu", "userPrincipalName": "other@wsu.edu"})
+    assert sender({"from": {"emailAddress": {"address": "a@example.com"}}}) == "a@example.com"
+    global ACCOUNT
+    saved, ACCOUNT = ACCOUNT, "jane.doe@example.com"
+    try:
+        assert is_expected({"mail": "jane.doe@example.com", "userPrincipalName": "x"})
+        assert not is_expected({"mail": "other@example.com", "userPrincipalName": "other@example.com"})
+    finally:
+        ACCOUNT = saved
     listed = fmt_list([{
         "isRead": False,
         "receivedDateTime": "2026-10-06T20:00:00Z",
         "subject": "Hi",
         "id": "AAMk",
-        "from": {"emailAddress": {"address": "a@wsu.edu"}},
+        "from": {"emailAddress": {"address": "a@example.com"}},
     }])
-    assert listed.startswith("* ") and "a@wsu.edu" in listed and "AAMk" in listed
+    assert listed.startswith("* ") and "a@example.com" in listed and "AAMk" in listed
     assert clip("x" * 100).endswith("...")
     check_addr("a@b.co")
     held, sys.stderr = sys.stderr, open(os.devnull, "w")
